@@ -143,6 +143,12 @@ class IndexManagerService(ctx: ServiceContext[ConfigurationArgs])(implicit adapt
   val trackIndexATimes = ctx.args.config.getBoolean("clouseau.track_index_atimes", false)
   val lru = new LRU(trackIndexAccesses = trackIndexATimes)
   val waiters = Map[String, List[((Pid, Any), Pid)]]()
+  // deletes waiting on an in-flight open or an in-flight directory delete
+  val pendingDeletes = Map[String, List[(Pid, Any)]]()
+  // paths whose directory is being removed on a forked fiber
+  val deleting = scala.collection.mutable.Set[String]()
+  // opens received while a delete was in flight, started once it finishes
+  val deferredOpens = Map[String, (AnalyzerOptions, List[((Pid, Any), Pid)])]()
   val countLocksEnabled = ctx.args.config.getBoolean("clouseau.count_locks", false)
   if (countLocksEnabled) {
     val lockClass = Class.forName("org.apache.lucene.store.NativeFSLock")
@@ -187,25 +193,22 @@ class IndexManagerService(ctx: ServiceContext[ConfigurationArgs])(implicit adapt
         if (cachedPid != null) {
           lru.remove(cachedPid)
         }
-        waiters.get(path) match {
-          case None =>
-            val cnode = node.asInstanceOf[ClouseauNode]
-            val managerPid = Pid.toScala(self.pid)
-            val effect = for {
-              timed <- IndexService.openZIO(cnode, ctx.args.config, path, options).timed
-              (timeSpent, result) = timed
-              _     <- ZIO.succeed(openTimer.update(timeSpent))
-              _ <- result match {
-                case ('ok, pid: Pid) =>
-                  sendZIO(managerPid, ('open_ok, path, pid))
-                case error =>
-                  sendZIO(managerPid, ('open_error, path, error))
-              }
-            } yield ()
-            adapter.forkScoped(effect).unsafeRunWith(cnode.runtime)
-            waiters.put(path, List((tag, peer)))
-          case Some(list) =>
-            waiters.put(path, (tag, peer) :: list)
+        if (deleting.contains(path)) {
+          // a delete is in flight for this path; hold the open until it
+          // finishes so we don't build an index over a directory being removed
+          val (opts, queued) = deferredOpens.get(path) match {
+            case Some((o, q)) => (o, q)
+            case None         => (options, Nil)
+          }
+          deferredOpens.put(path, (opts, (tag, peer) :: queued))
+        } else {
+          waiters.get(path) match {
+            case None =>
+              startOpen(path, options)
+              waiters.put(path, List((tag, peer)))
+            case Some(list) =>
+              waiters.put(path, (tag, peer) :: list)
+          }
         }
         'noreply
       }
@@ -214,7 +217,18 @@ class IndexManagerService(ctx: ServiceContext[ConfigurationArgs])(implicit adapt
     case DeleteDocMsg(path: String) =>
       lru.get(path) match {
         case null =>
-          ('error, 'not_found)
+          if (waiters.contains(path) || deleting.contains(path)) {
+            // an open or a delete is already in flight for this path; defer our
+            // reply until it resolves instead of reporting not_found or racing it
+            pendingDeletes.put(path, tag :: pendingDeletes.getOrElse(path, Nil))
+            'noreply
+          } else {
+            // nothing in flight: remove the directory on a forked fiber and
+            // reply when it's gone, so the manager never blocks on filesystem IO
+            startDelete(path)
+            pendingDeletes.put(path, List(tag))
+            'noreply
+          }
         case pid: Pid =>
           pid ! 'delete
           'ok
@@ -250,9 +264,31 @@ class IndexManagerService(ctx: ServiceContext[ConfigurationArgs])(implicit adapt
           }
         case None => ()
       }
+      // a delete arrived during the open: the index exists now, so let it
+      // delete itself and ack the waiting caller(s)
+      applyPendingDeletes(path, pid ! 'delete)
       'noreply
     case ('open_error, path: String, error: Any) =>
       replyAll(path, error)
+      // the open failed; if a delete was waiting, remove any partial directory
+      // it left behind (pending callers are acked when that delete finishes)
+      if (pendingDeletes.contains(path)) {
+        startDelete(path)
+      }
+      'noreply
+    case ('delete_done, path: String) =>
+      deleting.remove(path)
+      pendingDeletes.remove(path) match {
+        case Some(tags) => for (tag <- tags) Service.reply(tag, 'ok)
+        case None       => ()
+      }
+      // opens that arrived while we were deleting can proceed now
+      deferredOpens.remove(path) match {
+        case Some((options, list)) =>
+          startOpen(path, options)
+          waiters.put(path, list)
+        case None => ()
+      }
       'noreply
     case ('touch_lru, path: String) =>
       lru.get(path)
@@ -302,6 +338,61 @@ class IndexManagerService(ctx: ServiceContext[ConfigurationArgs])(implicit adapt
       case None =>
         'ok
     }
+  }
+
+  // run the deferred delete action for a path, then reply 'ok to each caller
+  // whose delete we held while the open was in flight
+  private def applyPendingDeletes(path: String, delete: => Unit): Unit = {
+    pendingDeletes.remove(path) match {
+      case Some(tags) =>
+        delete
+        for (tag <- tags) Service.reply(tag, 'ok)
+      case None => ()
+    }
+  }
+
+  // fork the index open and report the outcome back as a message
+  private def startOpen(path: String, options: AnalyzerOptions): Unit = {
+    val cnode = node.asInstanceOf[ClouseauNode]
+    val managerPid = Pid.toScala(self.pid)
+    val effect = for {
+      timed <- IndexService.openZIO(cnode, ctx.args.config, path, options).timed
+      (timeSpent, result) = timed
+      _     <- ZIO.succeed(openTimer.update(timeSpent))
+      _ <- result match {
+        case ('ok, pid: Pid) =>
+          sendZIO(managerPid, ('open_ok, path, pid))
+        case error =>
+          sendZIO(managerPid, ('open_error, path, error))
+      }
+    } yield ()
+    adapter.forkScoped(effect).unsafeRunWith(cnode.runtime)
+  }
+
+  // remove the index directory on a forked fiber so the manager never blocks on
+  // IO, then report completion so deferred deletes and opens can be released
+  private def startDelete(path: String): Unit = {
+    val cnode = node.asInstanceOf[ClouseauNode]
+    val managerPid = Pid.toScala(self.pid)
+    // report completion unconditionally (even on failure or interruption) so a
+    // path is never left stuck in `deleting`
+    val effect = ZIO
+      .attemptBlocking(recursivelyDelete(new File(rootDir, path)))
+      .ignore
+      .ensuring(sendZIO(managerPid, ('delete_done, path)).ignore)
+    adapter.forkScoped(effect).unsafeRunWith(cnode.runtime)
+    // add after the fork so a fork failure can't strand the path with no fiber;
+    // the manager is single-threaded, so it can't process delete_done until this
+    // handler returns, well after this line
+    deleting.add(path)
+  }
+
+  private def recursivelyDelete(fileOrDir: File): Unit = {
+    if (fileOrDir.isDirectory) {
+      for (file <- Option(fileOrDir.listFiles).getOrElse(Array()))
+        recursivelyDelete(file)
+    }
+    fileOrDir.delete
   }
 
 }

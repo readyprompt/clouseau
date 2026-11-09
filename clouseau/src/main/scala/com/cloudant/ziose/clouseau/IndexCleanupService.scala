@@ -25,6 +25,10 @@ class IndexCleanupService(ctx: ServiceContext[ConfigurationArgs])(implicit adapt
 
   val logger = LoggerFactory.getLogger("clouseau.cleanup")
   val rootDir = new File(ctx.args.config.getString("clouseau.dir", "target/indexes"))
+  // cap the wait on the manager's delete so a manager that dies mid-delete
+  // fails this cleanup call (cleanup restarts) instead of hanging forever; the
+  // manager finishes the delete on its own regardless
+  private val DeleteCallTimeoutMs = 30000L
 
   override def handleInit(): Unit = {
     logger.debug(s"handleInit(capacity = ${adapter.capacity})")
@@ -64,13 +68,9 @@ class IndexCleanupService(ctx: ServiceContext[ConfigurationArgs])(implicit adapt
     val m = includePattern.matcher(fileOrDir.getAbsolutePath)
     if (m.find && !activeSigs.contains(m.group(1))) {
       logger.info("Removing unreachable index " + m.group)
-      call('main, ('delete, m.group)) match {
-        case 'ok =>
-          'ok
-        case ('error, 'not_found) =>
-          recursivelyDelete(fileOrDir, false)
-          fileOrDir.delete
-      }
+      // the manager owns deletion: it kills a running index or removes the
+      // directory itself, so we no longer delete here and race an open.
+      call('main, ('delete, m.group), DeleteCallTimeoutMs)
     }
   }
 
