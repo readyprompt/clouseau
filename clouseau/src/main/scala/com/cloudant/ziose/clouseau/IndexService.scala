@@ -986,11 +986,10 @@ object IndexService {
           result <- built match {
             case Right(serviceArgs) =>
               val serviceCtx = new ServiceContext[IndexServiceArgs] { val args = serviceArgs }
-              restore(
-                node
-                  .spawnServiceZIO[IndexService, IndexServiceArgs](IndexServiceBuilder.make(node, serviceCtx))
-                  .map(actor => ('ok, Pid.toScala(actor.self.pid)))
-              )
+              val spawned = node
+                .spawnServiceZIO[IndexService, IndexServiceArgs](IndexServiceBuilder.make(node, serviceCtx))
+                .map(actor => ('ok, Pid.toScala(actor.self.pid)))
+              restore(spawned)
                 .catchAll { error =>
                   ZIO.attempt(serviceArgs.writer.rollback()).ignore.as(('error, error.toString))
                 }

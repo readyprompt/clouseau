@@ -44,7 +44,7 @@ case class MetricsGroup(klass: Class[_], metricsRegistry: ScalangMeterRegistry) 
     def getMeanRate           = codahaleTimer.getMeanRate()
 
     def update(duration: zio.Duration): Unit =
-      codahaleTimer.update(duration.toNanos, java.util.concurrent.TimeUnit.NANOSECONDS)
+      codahaleTimer.update(duration)
   }
 
   def counter(name: String): Counter = {
